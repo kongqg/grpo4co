@@ -1,0 +1,50 @@
+[2025-12-13 23:37:29,998][root][INFO] - agent: a2c
+grpo:
+  supervision_mode: outcome
+  clip_eps: 0.1
+  kl_coef: 0.005
+  percentile_p: -1
+  mean_reward_method: true
+  reward_mode: sparse
+ppo:
+  lambda: 0.95
+  normalize_adv: true
+env:
+  name: sudoku
+  registered_version: Sudoku-very-easy-v0
+  network:
+    key_size: 32
+    num_heads: 4
+    policy_layers:
+    - 128
+    value_layers:
+    - 128
+  training:
+    num_epochs: 300
+    num_learner_steps_per_epoch: 1000
+    n_steps: 40
+    total_batch_size: 128
+  evaluation:
+    eval_total_batch_size: 1024
+    greedy_eval_total_batch_size: 1024
+  a2c:
+    normalize_advantage: false
+    discount_factor: 1.0
+    bootstrapping_factor: 0.95
+    l_pg: 1.0
+    l_td: 1.0
+    l_en: 0.01
+    learning_rate: 0.0001
+seed: 0
+logger:
+  type: tensorboard
+  project: grpo4co
+  name: sudoku
+  save_checkpoint: true
+
+[2025-12-13 23:37:29,998][root][INFO] - {'devices': [CudaDevice(id=0)]}
+[2025-12-13 23:37:30,235][root][INFO] - sudoku
+[2025-12-13 23:37:35,569][root][INFO] - Starting logger.
+[2025-12-14 21:21:15,830][root][INFO] - Saving checkpoint...
+[2025-12-14 21:21:15,848][root][INFO] - Checkpoint saved at 'training_state'.
+[2025-12-14 21:21:15,848][root][INFO] - Closing logger...

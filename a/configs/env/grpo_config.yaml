@@ -1,0 +1,11 @@
+agent: "grpo"
+# agent: "a2c"
+grpo:
+  supervision_mode: "outcome"
+#  supervision_mode: "process"
+#  supervision_mode: "ppo_by_steps"
+  clip_eps: 0.15
+  normalize_adv: true
+  kl_coef: 0.1
+  num_policy_updates: 2
+  repeats_per_instance: 8

@@ -1,0 +1,50 @@
+[2025-11-15 21:30:21,776][root][INFO] - agent: grpo
+grpo:
+  supervision_mode: outcome
+  clip_eps: 0.1
+  normalize_adv: true
+  kl_coef: 0.005
+  percentile_p: 0.7
+  mean_reward_method: false
+  reward_mode: sparse
+ppo:
+  lambda: 0.95
+  normalize_adv: true
+env:
+  name: knapsack
+  registered_version: Knapsack-v1
+  network:
+    transformer_num_blocks: 6
+    transformer_num_heads: 8
+    transformer_key_size: 16
+    transformer_mlp_units:
+    - 512
+  training:
+    num_epochs: 100
+    num_learner_steps_per_epoch: 8
+    n_steps: 1000
+    total_batch_size: 8
+  evaluation:
+    eval_total_batch_size: 10000
+    greedy_eval_total_batch_size: 10000
+  a2c:
+    normalize_advantage: false
+    discount_factor: 1.0
+    bootstrapping_factor: 0.95
+    l_pg: 1.0
+    l_td: 1.0
+    l_en: 0.01
+    learning_rate: 0.0001
+seed: 0
+logger:
+  type: tensorboard
+  project: grpo4co
+  name: knapsack
+  save_checkpoint: true
+
+[2025-11-15 21:30:21,776][root][INFO] - {'devices': [CudaDevice(id=0)]}
+[2025-11-15 21:30:21,987][root][INFO] - knapsack
+[2025-11-15 21:30:27,113][root][INFO] - Starting logger.
+[2025-11-16 00:06:43,697][root][INFO] - Saving checkpoint...
+[2025-11-16 00:06:43,778][root][INFO] - Checkpoint saved at 'training_state'.
+[2025-11-16 00:06:43,778][root][INFO] - Closing logger...

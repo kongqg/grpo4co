@@ -1,0 +1,525 @@
+# ppo_by_steps.py
+import sys
+from typing import Dict, Tuple, Any
+
+import jax
+from jax import lax
+import jax.numpy as jnp
+import rlax
+from chex import dataclass
+from jumanji.training.agents.a2c import A2CAgent
+from jumanji.training.types import (
+    ActingState
+)
+from jumanji.training.types import Transition
+from jumanji.types import StepType
+
+
+@dataclass
+class GRPOConfig:
+    clip_eps: float = 0.1
+    supervision_mode: str = "outcome"
+    num_policy_updates: int = 3
+    kl_coef: float = 0.0
+    percentile_p: int = 2
+    mean_reward_method: bool = False
+    reward_mode: str = "dense"
+
+def _tree_true_like(x):
+    return jax.tree.map(lambda t: jnp.ones_like(t, dtype=bool), x)
+
+
+def _apply_mask_to_logits(logits, mask):
+    def f(l, m):
+        m = jnp.asarray(m, dtype=bool).reshape(l.shape)
+        return jnp.where(m, l, jnp.full_like(l, -1e9))
+    return jax.tree.map(f, logits, mask)
+
+
+def _maybe_extract_action_mask(obs, logits):
+    mask = None
+    if hasattr(obs, "action_mask"):
+        mask = obs.action_mask
+    elif isinstance(obs, dict) and "action_mask" in obs:
+        mask = obs["action_mask"]
+    return jax.tree.map(lambda m: m.astype(bool), mask) if mask is not None else _tree_true_like(logits)
+
+# ===================================================================
+# GRPO Agent 实现
+# ===================================================================
+
+class GRPOAgent(A2CAgent):
+
+    def __init__(self, grpo_cfg: GRPOConfig, **kwargs: Dict[str, Any]):
+        super().__init__(**kwargs)
+        self.grpo_cfg = grpo_cfg
+        self.batch_size = int(getattr(self, "total_batch_size", kwargs.get("total_batch_size")))
+
+
+    def _compute_lambda_weights_from_matrix(self,matrix_actions: jnp.ndarray, mask: jnp.ndarray) -> jnp.ndarray:
+        raw_actions = jnp.swapaxes(matrix_actions, 0, 1)  # (T, G)
+        raw_mask = jnp.swapaxes(mask, 0, 1)  # (T, G)
+
+        if raw_actions.ndim > 2:
+            flat = raw_actions.reshape(raw_actions.shape[0], raw_actions.shape[1], -1)
+            is_equal = (flat[:, :, None] == flat[:, None, :]).all(axis=-1)
+        else:
+            is_equal = (raw_actions[:, :, None] == raw_actions[:, None, :])
+        valid_match = raw_mask[:, :, None] & raw_mask[:, None, :]
+        is_equal = is_equal & valid_match
+
+        # 前缀匹配 (T, G, G)
+        prefix_match = jnp.cumprod(is_equal.astype(jnp.float32), axis=0)
+
+        lambda_counts = jnp.sum(prefix_match, axis=2)
+        weights = jnp.where(lambda_counts > 0, 1.0 / lambda_counts, 1.0)
+        return jnp.swapaxes(weights, 0, 1)
+
+    def _compute_lambda_for_one_batch(self,raw_actions, ep_ids, done, T, max_eps=64):
+        def count_pos(carry, d):
+            pos = jnp.where(carry['prev_done'], 0, carry['pos'] + 1)
+            return {'pos': pos, 'prev_done': d}, pos
+
+        _, rel_pos = jax.lax.scan(count_pos, {'pos': -1, 'prev_done': True}, done)  # (T,)
+        safe_ep_ids = jnp.clip(ep_ids, 0, max_eps - 1)
+        valid_mask = ep_ids < max_eps
+
+        # 初始化矩阵
+        act_shape = raw_actions.shape[1:]
+        matrix_shape = (max_eps, T) + act_shape
+
+        # 填充 Actions
+        matrix_actions = jnp.zeros(matrix_shape, dtype=raw_actions.dtype)
+        matrix_actions = matrix_actions.at[safe_ep_ids, rel_pos].set(raw_actions)
+
+        # 填充 Mask (标记哪里有真实数据)
+        matrix_mask = jnp.zeros((max_eps, T), dtype=bool)
+        matrix_mask = matrix_mask.at[safe_ep_ids, rel_pos].set(valid_mask)
+
+        # 3. 计算 A-GRPO 权重
+        # weights_matrix: (Max_Eps, T)
+        weights_matrix = self._compute_lambda_weights_from_matrix(matrix_actions, matrix_mask)
+
+        # 4. Gather 回 (T,)
+        flat_weights = weights_matrix[safe_ep_ids, rel_pos]
+
+        # 对于超出 max_eps 的部分或者 padding 部分，权重设为 1.0 (退化为普通 GRPO)
+        flat_weights = jnp.where(valid_mask, flat_weights, 1.0)
+        return flat_weights
+
+    def _compute_advantage_sparse_reward(self, params, data : Transition):
+        r = data.reward.astype(jnp.float32) # (T, B)
+        done = data.extras["done"].astype(bool) # (T, B)
+        T, B = r.shape
+        prev_done = jnp.roll(done, shift=1, axis=0).at[0, :].set(False)
+        ep_ids = jnp.cumsum(prev_done.astype(jnp.int32), axis=0)  # (T, B)
+        num_ep = jnp.sum(done, axis=0).astype(jnp.int32)  # (B,)  episode_id
+        valid = (ep_ids < num_ep[None, :])  # (T, B)
+        rb = jnp.swapaxes(r, 0, 1)  # (B, T)
+        idsb = jnp.swapaxes(ep_ids, 0, 1)  # (B, T)
+        vb = jnp.swapaxes(valid, 0, 1)  # (B, T)
+
+        def per_batch_last(r_b, id_b, v_b, n_b, d_b):
+            data_to_sum = (r_b * d_b.astype(jnp.float32) * v_b.astype(jnp.float32))
+            ids = jnp.where(v_b, id_b, 0)
+            all_ids = jnp.arange(T, dtype=jnp.int32)
+
+            def _get_sum_for_one_id(i):
+                return jnp.sum(data_to_sum * (ids == i))
+
+            seg_last = jax.vmap(_get_sum_for_one_id)(all_ids)
+            seg_last = jnp.where(all_ids < n_b, seg_last, 0.0)
+            R_last = seg_last[ids] * v_b.astype(jnp.float32)
+            return R_last, seg_last
+        # seg shape: (B, T)  R_step (B, T)
+        R_step_t, seg = jax.vmap(per_batch_last, in_axes=(0, 0, 0, 0, 0))(rb, idsb, vb, num_ep, jnp.swapaxes(done, 0, 1))
+        if self.grpo_cfg.percentile_p > 0:
+            p = self.grpo_cfg.percentile_p
+            mask_e_episode = (jnp.arange(T)[None, :] < num_ep[:, None])  # (B, T)
+            seg_masked = jnp.where(mask_e_episode, seg, jnp.inf)  # (B, T)
+            sorted_seg = jnp.sort(seg_masked, axis=1)  # (B, T)
+            # num_ep: (B,)
+            num_ep_f = num_ep.astype(jnp.float32)
+            # 找到percentile的值
+            idx_f = p * jnp.maximum(num_ep_f - 1.0, 0.0)
+            idx = jnp.floor(idx_f).astype(jnp.int32)  # (B,)
+            idx = jnp.clip(idx, 0, T - 1)
+            percentile = jnp.take_along_axis(
+                sorted_seg,
+                idx[:, None],  # (B, 1)
+                axis=1,
+            )  # (B, 1)
+        mask_e = (jnp.arange(T)[None, :] < num_ep[:, None]).astype(jnp.float32)  # (B, T)
+        count = jnp.maximum(num_ep.astype(jnp.float32), 1.0)[:, None] # B, 1
+        mean = (seg * mask_e).sum(axis=1, keepdims=True) / count # B, 1
+        mask = vb.astype(jnp.float32)
+
+        if self.grpo_cfg.mean_reward_method:
+            var = (((seg - mean) ** 2) * mask_e).sum(axis=1, keepdims=True) / count
+            std = jnp.sqrt(var + 1e-8)
+            advantage = ((R_step_t - mean) / std) * mask
+        elif self.grpo_cfg.percentile_p > 0:
+            var = (((seg - percentile) ** 2) * mask_e).sum(axis=1, keepdims=True) / count
+            std = jnp.sqrt(var + 1e-8)
+            advantage = ((R_step_t - percentile) / std) * mask
+        advantage = jnp.swapaxes(advantage, 0, 1)  # (T, B)
+        MAX_EPS_SAFE = 64
+
+        lambda_weights = jax.vmap(
+            self._compute_lambda_for_one_batch,
+            in_axes=(1, 1, 1, None, None)
+        )(data.extras.get("raw_action"), ep_ids, done, T, MAX_EPS_SAFE)
+
+        # vmap 输出形状是 (B, T)，需要转置回 (T, B)
+        lambda_weights = jnp.swapaxes(lambda_weights, 0, 1)
+
+        targets = jnp.zeros_like(r)
+        return advantage, targets, num_ep.mean(), lambda_weights
+
+    def _compute_advantage_dense_reward(self, params, data: Transition):
+        """
+        Dense 模式下的 GRPO advantage 计算。
+
+        核心公式（per-step）：
+            A_i = (R_i - mean_group) / std_group
+
+        其中：
+        - R_i = 从当前步到当前 episode 结束的 expected return
+        - mean_group / std_group：
+            * 如果在同一 batch 内存在“前缀完全相同”的其它 trajectory，
+              就只在这些 trajectory 上做 mean / std；
+            * 如果前缀只有自己（group_size == 1），
+              则 fallback 到同一 batch 内“相同 episode 内位置 pos”的全局 mean / std。
+        """
+        r = data.reward.astype(jnp.float32)  # (T, B)
+        done = data.extras["done"].astype(bool)  # (T, B)
+        raw_action = data.extras.get("raw_action")  # (T, B, ...)
+        T, B = r.shape
+
+        # 统计每个 batch 中完成的 episode 数（仅用于监控）
+        num_ep = jnp.sum(done, axis=0).astype(jnp.int32)  # (B,)
+
+        # episode id：ep_ids[t, b] 表示 (t, b) 属于该 batch 的第几条 episode
+        prev_done = jnp.roll(done, shift=1, axis=0).at[0, :].set(False)
+        ep_ids = jnp.cumsum(prev_done.astype(jnp.int32), axis=0)  # (T, B)
+        ep_ids_bt = jnp.swapaxes(ep_ids, 0, 1)  # (B, T)
+
+        # 变成 batch-major 方便 vmap
+        rb = jnp.swapaxes(r, 0, 1)  # (B, T)
+        done_bt = jnp.swapaxes(done, 0, 1)  # (B, T)
+        raw_action_bt = jnp.swapaxes(raw_action, 0, 1)  # (B, T, ...)
+
+        # 1. 每个 batch 内先算 per-step expected return R_i
+        def per_batch_expected_reward(r_b, d_b):
+            """给定一条 batch 轨迹 r_b, done_b，计算从每一步开始的到 episode 结束的回报。"""
+
+            def _cum_step_reward(carry, inputs):
+                r_t, done_t = inputs
+                not_done = 1.0 - done_t.astype(jnp.float32)
+                g_t = r_t + not_done * carry
+                return g_t, g_t
+
+            _, expected_reward = lax.scan(
+                _cum_step_reward,
+                0.0,
+                (r_b, d_b),
+                reverse=True,
+            )
+            return expected_reward  # (T,)
+
+        # expected_bt[b, t] = 该 batch 中第 b 条环境在时间 t 的 expected return
+        expected_bt = jax.vmap(per_batch_expected_reward, in_axes=(0, 0))(rb, done_bt)  # (B, T)
+
+        MAX_EPS_SAFE = 64  # 与 sparse 模式中一致，最多考虑这么多 episode
+
+        def per_batch_adv_dense(exp_b, ep_ids_b, done_b, raw_action_b):
+            """
+            针对单个 batch (单个环境轨迹) 计算 dense GRPO advantage。
+
+            输入：
+            - exp_b      : (T,)
+            - ep_ids_b   : (T,)
+            - done_b     : (T,)
+            - raw_action_b : (T, ...)
+
+            输出：
+            - adv_b      : (T,)
+            """
+            T = exp_b.shape[0]
+
+            # 计算每一步在当前 episode 内的相对位置 rel_pos：0,1,2,...
+            def count_pos(carry, d_t):
+                pos = jnp.where(carry["prev_done"], 0, carry["pos"] + 1)
+                return {"pos": pos, "prev_done": d_t}, pos
+
+            _, rel_pos = lax.scan(
+                count_pos,
+                {"pos": -1, "prev_done": True},
+                done_b,
+            )  # (T,)
+
+            safe_ep_ids = jnp.clip(ep_ids_b, 0, MAX_EPS_SAFE - 1)  # (T,)
+            valid_episode = ep_ids_b < MAX_EPS_SAFE  # (T,)
+
+            # --- 构造 episode × position 的矩阵表示 ---
+            act_shape = raw_action_b.shape[1:]
+            matrix_actions = jnp.zeros((MAX_EPS_SAFE, T) + act_shape, raw_action_b.dtype)
+            matrix_actions = matrix_actions.at[safe_ep_ids, rel_pos].set(raw_action_b)
+
+            matrix_mask = jnp.zeros((MAX_EPS_SAFE, T), dtype=bool)
+            matrix_mask = matrix_mask.at[safe_ep_ids, rel_pos].set(valid_episode)
+
+            matrix_exp = jnp.zeros((MAX_EPS_SAFE, T), exp_b.dtype)
+            matrix_exp = matrix_exp.at[safe_ep_ids, rel_pos].set(exp_b)
+
+            # time-major: pos × episode，用“位置”维度做前缀 cumsum
+            actions_tm = jnp.swapaxes(matrix_actions, 0, 1)  # (T, E, ...)
+            mask_tm = jnp.swapaxes(matrix_mask, 0, 1)  # (T, E)
+            exp_tm = jnp.swapaxes(matrix_exp, 0, 1)  # (T, E)
+            E = actions_tm.shape[1]
+
+            # --- 计算前缀相等关系 prefix_match[t, i, j] ---
+            if actions_tm.ndim > 3:
+                flat = actions_tm.reshape(actions_tm.shape[0], actions_tm.shape[1], -1)
+            elif actions_tm.ndim == 3:
+                flat = actions_tm
+            else:  # 标量 action
+                flat = actions_tm[..., None]
+
+            # is_equal[t, i, j] 表示在位置 t，episode i 和 j 的 action 是否相同
+            is_equal = (flat[:, :, None, :] == flat[:, None, :, :]).all(axis=-1)  # (T, E, E)
+            valid_match = mask_tm[:, :, None] & mask_tm[:, None, :]  # (T, E, E)
+            is_equal = is_equal & valid_match
+
+            # prefix_match[t, i, j]：从 pos=0 到 pos=t 的整个前缀都相同
+            prefix_match = jnp.cumprod(is_equal.astype(jnp.float32), axis=0)  # (T, E, E)
+            group_size = jnp.sum(prefix_match, axis=2)  # (T, E)
+
+            exp_tm_f = exp_tm.astype(jnp.float32)
+
+            # 每个 (t, i) 的 group 内 R 的和 / 和的平方和
+            group_sum = jnp.einsum("tij,tj->ti", prefix_match, exp_tm_f)  # (T, E)
+            group_sum2 = jnp.einsum("tij,tj->ti", prefix_match, exp_tm_f ** 2)  # (T, E)
+
+            group_mean = jnp.where(
+                group_size > 0,
+                group_sum / jnp.maximum(group_size, 1.0),
+                0.0,
+            )
+            group_var = jnp.where(
+                group_size > 0,
+                jnp.maximum(0.0, group_sum2 / jnp.maximum(group_size, 1.0) - group_mean ** 2),
+                0.0,
+            )
+
+            # --- fallback：同一 batch 内同一“位置 pos”的全局 mean/std ---
+            mask_f = mask_tm.astype(jnp.float32)  # (T, E)
+            count_global = jnp.sum(mask_f, axis=1)  # (T,)
+            sum_global = jnp.sum(exp_tm_f * mask_f, axis=1)
+            sum2_global = jnp.sum((exp_tm_f ** 2) * mask_f, axis=1)
+
+            mean_global = jnp.where(
+                count_global > 0,
+                sum_global / jnp.maximum(count_global, 1.0),
+                0.0,
+            )  # (T,)
+            var_global = jnp.where(
+                count_global > 0,
+                jnp.maximum(0.0, sum2_global / jnp.maximum(count_global, 1.0) - mean_global ** 2),
+                0.0,
+            )  # (T,)
+
+            mean_global_exp = jnp.broadcast_to(mean_global[:, None], group_mean.shape)  # (T, E)
+            var_global_exp = jnp.broadcast_to(var_global[:, None], group_var.shape)  # (T, E)
+
+            # 只有 group_size > 1 且该位置有效时，才使用“前缀 group”统计；否则用全局统计
+            use_group = (group_size > 1.0) & mask_tm
+
+            mean_ti = jnp.where(use_group, group_mean, mean_global_exp)
+            var_ti = jnp.where(use_group, group_var, var_global_exp)
+            std_ti = jnp.sqrt(var_ti + 1e-8)
+
+            # 在 (pos, episode) 空间计算 advantage
+            adv_tm = jnp.where(
+                mask_tm,
+                (exp_tm_f - mean_ti) / std_ti,
+                0.0,
+            )  # (T, E)
+
+            # 映射回 episode × pos
+            adv_matrix = jnp.swapaxes(adv_tm, 0, 1)  # (E, T)
+
+            # 从矩阵还原回原始时间轴 (T,)
+            adv_from_matrix = adv_matrix[safe_ep_ids, rel_pos]  # (T,)
+
+            # 对于 ep_id >= MAX_EPS_SAFE 的步（没有参加前缀 group），
+            # fallback：使用“同一位置 pos 的全局 mean/std”
+            mean_global_step = mean_global[rel_pos]  # (T,)
+            std_global_step = jnp.sqrt(var_global[rel_pos] + 1e-8)  # (T,)
+            adv_fallback = (exp_b - mean_global_step) / std_global_step  # (T,)
+
+            return jnp.where(valid_episode, adv_from_matrix, adv_fallback)  # (T,)
+
+        # 只在 mean_reward_method=True 时使用 GRPO 归一化
+        if self.grpo_cfg.mean_reward_method:
+            advantage_bt = jax.vmap(
+                per_batch_adv_dense, in_axes=(0, 0, 0, 0)
+            )(expected_bt, ep_ids_bt, done_bt, raw_action_bt)  # (B, T)
+        else:
+            advantage_bt = jnp.zeros_like(expected_bt)
+
+        advantage = jnp.swapaxes(advantage_bt, 0, 1)  # (T, B)
+
+        targets = jnp.zeros_like(r)
+        return advantage, targets, num_ep.mean()
+
+    def _loss_from_data(self, params, acting_state: ActingState, data: Transition):
+        policy_apply = self.actor_critic_networks.policy_network.apply
+
+        def fwd(_, ob):
+            return None, policy_apply(params.actor, ob)
+
+        _, new_logits = jax.lax.scan(fwd, None, data.observation)
+        mask_b = data.extras.get("action_mask", _tree_true_like(new_logits))
+        masked_new_logits = _apply_mask_to_logits(new_logits, mask_b)
+        dist = self.actor_critic_networks.parametric_action_distribution
+        logp_new = dist.log_prob(masked_new_logits, data.extras.get("raw_action"))
+        ratio = jnp.exp(logp_new - data.log_prob)
+        lambda_weights = jnp.ones_like(ratio)
+        if self.grpo_cfg.reward_mode == "dense":
+            advantage, targets, num_ep_mean = self._compute_advantage_dense_reward(params, data)  # T, B
+        elif self.grpo_cfg.reward_mode == "sparse":
+            advantage, targets, num_ep_mean, lambda_weights= self._compute_advantage_sparse_reward(params, data)  # T, B
+
+        weight = data.extras.get("valid_mask", jnp.ones_like(ratio))
+        clipped = jnp.clip(ratio, 1.0 - self.grpo_cfg.clip_eps, 1.0 + self.grpo_cfg.clip_eps)
+        final_weight = weight * lambda_weights
+        surr1 = ratio * jax.lax.stop_gradient(advantage)
+        surr2 = clipped * jax.lax.stop_gradient(advantage)
+        policy_loss = - (jnp.minimum(surr1, surr2) * final_weight).sum() / (final_weight.sum() + 1e-8)
+        approx_kl = ((data.log_prob - logp_new) * final_weight).sum() / (final_weight.sum() + 1e-8)
+        key, ent_key = jax.random.split(acting_state.key)
+        entropy_t = dist.entropy(masked_new_logits, ent_key)
+        entropy = (entropy_t * weight).sum() / (weight.sum() + 1e-8)
+        entropy_loss = -entropy
+
+        # value_loss
+        total_loss = self.l_pg * policy_loss + self.l_en * entropy_loss
+        if self.grpo_cfg.kl_coef > 0.0:
+            total_loss = total_loss + self.grpo_cfg.kl_coef * approx_kl
+        metrics = dict(
+            total_loss=total_loss,
+            policy_loss=policy_loss,
+            entropy_loss=entropy_loss,
+            entropy=entropy,
+            advantage=advantage.mean(),
+            approx_kl=approx_kl,
+            num_ep_mean=num_ep_mean,
+            mean_lambda_weight=lambda_weights.mean(),
+        )
+        acting_state = acting_state._replace(key=key)
+        return total_loss, (acting_state, metrics)
+
+    def rollout_episodic(self, policy_params, value_params, acting_state: ActingState):
+        T_max = self.n_steps
+        env = self.env
+        dist = self.actor_critic_networks.parametric_action_distribution
+        policy_apply = self.actor_critic_networks.policy_network.apply
+        key = acting_state.key
+        B = self.batch_size
+        env_id = jnp.arange(B, dtype=jnp.int32)
+        key, reset_base = jax.random.split(key)
+        reset_keys = jax.random.split(reset_base, B)
+        reset_keys = jax.vmap(jax.random.fold_in, in_axes=(0, 0))(reset_keys, env_id)
+        state, timestep = env.reset(reset_keys)
+        inst_keys = reset_keys
+        first_obs = timestep.observation
+
+
+        def step_fn(carry, _):
+            key, state, obs_t = carry
+            key, actor_key = jax.random.split(key, 2)
+            actor_keys = jax.vmap(lambda k, i: jax.random.fold_in(k, i))(jax.random.split(actor_key, B), env_id) # (batch_size, 1)
+
+            logits_t = policy_apply(policy_params, obs_t)
+            mask_t = _maybe_extract_action_mask(obs_t, logits_t)
+            masked_logits_t = _apply_mask_to_logits(logits_t, mask_t)
+            raw_action_t = jax.vmap(dist.sample_no_postprocessing, in_axes=(0, 0))(masked_logits_t, actor_keys)
+            logp_t = dist.log_prob(masked_logits_t, raw_action_t)
+            action_t = dist.postprocess(raw_action_t)
+            next_state_raw, timestep = env.step(state, action_t)
+            reset_state, reset_timestep = env.reset(inst_keys)
+
+            def select(mask, old_leaf, new_leaf):
+                m = mask
+                for _ in range(new_leaf.ndim - m.ndim):
+                    m = m[..., None]
+                return jnp.where(m, new_leaf, old_leaf)
+
+            newly_done = (timestep.step_type == StepType.LAST)
+            next_obs_t = jax.tree.map(lambda old, new: select(newly_done, old, new), timestep.observation,
+                                      reset_timestep.observation)
+            next_state = jax.tree.map(lambda old, new: select(newly_done, old, new), next_state_raw, reset_state)
+            transition = (
+            obs_t, action_t, raw_action_t,timestep.reward, timestep.discount, next_obs_t, logp_t, mask_t, logits_t, newly_done)
+            carry_out = (key, next_state, next_obs_t)
+            return carry_out, transition
+
+        init_carry = (key, state, first_obs)
+        (_, _, _), traj = jax.lax.scan(step_fn, init_carry, None, length=T_max)
+        obs_b, action_b, raw_action_b, reward_b, discount_b, next_obs_b, logp_b, mask_b, logits_t, dones_b = traj
+
+        data = Transition(
+            observation=obs_b,
+            action=action_b,
+            reward=reward_b,
+            discount=discount_b,
+            log_prob=logp_b,
+            next_observation=next_obs_b,
+            extras={
+                "reset_keys": inst_keys,
+                "env_id": env_id,
+                "action_mask": mask_b,
+                "done": dones_b,
+                "raw_action": raw_action_b,
+            },
+            logits=logits_t,
+        )
+        new_acting_state = acting_state._replace(key=key)
+        return new_acting_state, data
+
+
+    def run_epoch(self, training_state):
+        params = training_state.params_state.params
+        opt_state = training_state.params_state.opt_state
+        update_count = training_state.params_state.update_count
+        acting_state = training_state.acting_state
+        acting_state, data = self.rollout_episodic(policy_params=params.actor,
+                                                   value_params=params.critic,
+                                                   acting_state=acting_state)
+
+
+
+
+        K = int(getattr(self.grpo_cfg, "num_policy_updates", 3))
+        metrics = {}
+        for _ in range(K):
+            (loss, (acting_state, inner_metrics)), grads = jax.value_and_grad(self._loss_from_data, has_aux=True)(
+                params, acting_state, data
+            )
+
+            #  L2 norm
+            actor_grads_leaves = jax.tree_util.tree_leaves(grads.actor)
+            actor_global_norm = jnp.sqrt(
+                sum(jnp.sum(jnp.square(x)) for x in actor_grads_leaves if x is not None)
+            )
+            inner_metrics['grad_norm/actor_global_norm'] = actor_global_norm
+            updates, opt_state = self.optimizer.update(grads, opt_state, params)
+            params = jax.tree.map(lambda w, u: w + u, params, updates)
+            metrics = inner_metrics
+        new_params_state = training_state.params_state._replace(
+            params=params, opt_state=opt_state, update_count=update_count + K
+        )
+
+        new_state = training_state._replace(params_state=new_params_state, acting_state=acting_state)
+        return new_state, metrics

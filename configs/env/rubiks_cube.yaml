@@ -1,0 +1,36 @@
+defaults:
+  - grpo_config
+  - _self_
+env:
+  name: rubiks_cube_T
+  registered_version: RubiksCube-partly-scrambled-v0
+
+  network:
+    cube_embed_dim: 4
+    step_count_embed_dim: 0
+    dense_layer_dims: [ 512]
+
+  training:
+    num_epochs: 1000
+    num_learner_steps_per_epoch: 100
+    n_steps: 10
+    total_batch_size: 256
+
+  evaluation:
+    eval_total_batch_size: 1024
+    greedy_eval_total_batch_size: 1024
+
+  a2c:
+    normalize_advantage: False
+    discount_factor: 0.99
+    bootstrapping_factor: 0.95
+    l_pg: 1.0
+    l_td: 1.0
+    l_en: 0.01
+    learning_rate: 3e-4
+seed: 0
+logger:
+  type: "tensorboard"  # 指定日志记录器的类型为 tensorboard
+  project: "grpo4co"
+  name: "rubiks_cube_T"
+  save_checkpoint: true

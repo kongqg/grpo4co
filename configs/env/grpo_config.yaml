@@ -1,0 +1,19 @@
+agent: "grpo"
+#agent: "a2c"
+# agent: "ppo"
+grpo:
+  supervision_mode: "outcome"
+#  supervision_mode: "process"
+#   supervision_mode: "ppo"
+  clip_eps: 0.10
+  normalize_adv: true
+  kl_coef: 0.005
+  percentile_p: -1
+  mean_reward_method: true
+  reward_mode: "dense"
+
+ppo:
+  lambda: 0.95
+  normalize_adv: True
+  kl_coef: 0.0
+  clip_eps: 0.10
