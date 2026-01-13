@@ -42,6 +42,22 @@ from jumanji.environments.routing.multi_cvrp.reward import (
     SparseReward as Multi_cvrp_SparseReward,
 )
 
+class DoubleValueNetwork:
+    def __init__(self, base):
+        self.base = base
+
+    def init(self, key, obs):
+        k1, k2 = jax.random.split(key, 2)
+        return {
+            "choice": self.base.init(k1, obs),
+            "target": self.base.init(k2, obs),
+        }
+
+    def apply(self, params, obs):
+        v1 = self.base.apply(params["choice"], obs)
+        v2 = self.base.apply(params["target"], obs)
+        return v1, v2
+
 def setup_env(cfg: DictConfig) -> Environment:
     if cfg.grpo.reward_mode == "sparse":
         #if cfg.env.name == "sliding_tile_puzzle":
@@ -142,7 +158,7 @@ def setup_agent(cfg: DictConfig, env: Environment):
         )
     elif cfg.agent == "ppo":
         optimizer = optax.adam(cfg.env.a2c.learning_rate)
-        grpo_cfg = PPOConfig(
+        ppo_cfg = PPOConfig(
             clip_eps=cfg.ppo.clip_eps,
             normalize_adv=cfg.ppo.normalize_adv,
             kl_coef=cfg.ppo.kl_coef,
@@ -159,14 +175,20 @@ def setup_agent(cfg: DictConfig, env: Environment):
             l_pg=cfg.env.a2c.l_pg,
             l_td=cfg.env.a2c.l_td,
             l_en=cfg.env.a2c.l_en,
-            grpo_cfg=grpo_cfg,
+            ppo_cfg=ppo_cfg,
         )
     elif cfg.agent == "dhvl":
+
+        ac = actor_critic_networks._replace(
+            value_network=DoubleValueNetwork(actor_critic_networks.value_network))
+        actor_critic_networks = ac
         optimizer = optax.adam(cfg.env.a2c.learning_rate)
         dhvl_cfg = dhvlConfig(
             clip_eps=cfg.ppo.clip_eps,
             normalize_adv=cfg.ppo.normalize_adv,
             kl_coef=cfg.ppo.kl_coef,
+            bootstrapping_factor=cfg.dhvl.bootstrapping_factor,
+            policy_delay=cfg.dhvl.policy_delay
         )
         return dhvlAgent(
             env=env,
@@ -180,7 +202,7 @@ def setup_agent(cfg: DictConfig, env: Environment):
             l_pg=cfg.env.a2c.l_pg,
             l_td=cfg.env.a2c.l_td,
             l_en=cfg.env.a2c.l_en,
-            grpo_cfg=dhvl_cfg,
+            dhvl_cfg=dhvl_cfg,
         )
 
 

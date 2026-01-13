@@ -1,7 +1,7 @@
 """
-ppo.py
+dhvl.py
 
-A readable, standard PPO implementation for Jumanji-style agents (JAX + Haiku),
+A readable, standard dhvl implementation for Jumanji-style agents (JAX + Haiku),
 written to be JIT/scan-friendly.
 
 Key design points (important for correctness in JAX):
@@ -31,23 +31,23 @@ from jumanji.training.types import ActingState
 # -----------------------------------------------------------------------------
 
 @dataclass
-class PPOConfig:
-    # PPO clipping
+class dhvlConfig:
     clip_eps: float = 0.2
     # Value function loss weight
     vf_coef: float = 0.5
     # Entropy bonus weight
     ent_coef: float = 0.01
-    # Number of PPO epochs per rollout
+    # Number of dhvl epochs per rollout
     update_epochs: int = 4
-    # Minibatch size used for PPO updates
+    # Minibatch size used for dhvl updates
     minibatch_size: int = 64
     # Whether to normalize advantages across the rollout batch (recommended)
     normalize_adv: bool = True
-    # If True, use clipped value loss (recommended for PPO)
+    # If True, use clipped value loss (recommended for dhvl)
     clip_value_loss: bool = True
     # Use separate value clip epsilon; if None, reuse clip_eps
     value_clip_eps: float | None = None
+    kl_coef: float = 0.2
     policy_delay: int = 2
 
 
@@ -61,20 +61,23 @@ class RolloutTB:
     observation: Any                  # pytree with leaves [T, B, ...]
     raw_action: Any                   # pytree with leaves [T, B, ...] or [T, B]
     logp_old: jnp.ndarray             # [T, B]
-    value_old: jnp.ndarray            # [T, B]
+    value_choice_old: jnp.ndarray            # [T, B]
+    value_target_old: jnp.ndarray  # [T, B]
     reward: jnp.ndarray               # [T, B]
     discount: jnp.ndarray             # [T, B]  (0 at terminal, 1 otherwise)
 
 
 @dataclass
-class PPOBatchN:
+class dhvlBatchN:
     """Flattened rollout: leading dim [N] where N = T*B."""
-    observation: Any                  # pytree with leaves [N, ...]
-    raw_action: Any                   # pytree with leaves [N, ...] or [N]
-    logp_old: jnp.ndarray             # [N]
-    value_old: jnp.ndarray            # [N]
-    advantage: jnp.ndarray            # [N]
-    returns: jnp.ndarray              # [N]
+    observation: Any            # pytree leaves [N, ...]
+    raw_action: Any             # pytree leaves [N, ...] or [N]
+    logp_old: jnp.ndarray       # [N]
+    value_choice_old: jnp.ndarray   # [N]
+    value_target_old: jnp.ndarray   # [N]
+    returns_choice: jnp.ndarray     # [N]
+    returns_target: jnp.ndarray     # [N]
+    advantage: jnp.ndarray          # [N]
 
 
 # -----------------------------------------------------------------------------
@@ -174,45 +177,79 @@ def _make_minibatch_indices(
     return idx, mb_mask
 
 
-def _compute_gae(
+def _compute_highway_v_learning(
     rewards: jnp.ndarray,          # [T,B]
-    discounts: jnp.ndarray,        # [T,B]
-    values: jnp.ndarray,           # [T,B]
-    last_value: jnp.ndarray,       # [B]
+    discounts: jnp.ndarray,        # [T,B]  终止=0, 非终止=1
+    values_choice_old: jnp.ndarray,# [T,B]
+    values_target_old: jnp.ndarray,# [T,B]
+    last_value_choice: jnp.ndarray,# [B]
+    last_value_target: jnp.ndarray,# [B]
     gamma: float,
-    lam: float,
-) -> Tuple[jnp.ndarray, jnp.ndarray]:
-    """Standard GAE-Lambda (time-major). Returns (advantage, returns) both [T,B]."""
-    next_values = jnp.concatenate([values[1:], last_value[None, ...]], axis=0)  # [T,B]
-    deltas = rewards + gamma * discounts * next_values - values  # [T,B]
+    lam: float,                    #
+) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """
+    Highway-return version (time-major).
+    Returns: (advantage, returns_choice, returns_target)
+      - returns_choice: [T,B]
+      - returns_target: [T,B]
+      - advantage = returns_target - values_target_old
+    """
+    v_old_choice = values_choice_old.astype(jnp.float32)  # [T,B]
+    v_tp1 = jnp.concatenate([v_old_choice[1:], last_value_choice[None, ...]], axis=0)  # [T,B]
 
-    def gae_scan(carry, xs):
-        delta_t, discount_t = xs
-        gae_t = delta_t + gamma * lam * discount_t * carry
-        return gae_t, gae_t
+    v_old_target = values_target_old.astype(jnp.float32)  # [T,B]
+    v_tp2 = jnp.concatenate([v_old_target[1:], last_value_target[None, ...]], axis=0)  # [T,B]
 
-    init = jnp.zeros_like(last_value)  # [B]
-    _, adv_rev = jax.lax.scan(gae_scan, init, (deltas[::-1], discounts[::-1]))
-    advantage = adv_rev[::-1]  # [T,B]
-    returns = advantage + values
-    return advantage, returns
+    r = rewards.astype(jnp.float32)       # [T,B]
+    d = discounts.astype(jnp.float32)     # [T,B]
+
+    lambda_h = lam  # keep identical to your snippet
+
+    def highway_step(carry, xs):
+        R_next_1, R_next_2 = carry                # each [B]
+        r_t, d_t, v_tp1_t, v_tp2_t = xs           # each [B]
+
+        v_choice = lambda_h * R_next_1
+        v_target = lambda_h * R_next_2
+
+        high = (v_choice > v_tp1_t)
+        v_1 = jnp.where(high, v_choice, v_tp1_t)
+        v_2 = jnp.where(high, v_target, v_tp2_t)
+
+        R_t_1 = r_t + gamma * d_t * v_1
+        R_t_2 = r_t + gamma * d_t * v_2
+        return (R_t_1, R_t_2), (R_t_1, R_t_2)
+
+    _, (R_t_1, R_t_2) = jax.lax.scan(
+        highway_step,
+        (last_value_choice, last_value_target),
+        (r[::-1], d[::-1], v_tp1[::-1], v_tp2[::-1]),
+    )
+
+    returns_choice = R_t_1[::-1]  # [T,B]
+    returns_target = R_t_2[::-1]  # [T,B]
+
+    advantage = returns_target - v_old_target
+    advantage = jax.lax.stop_gradient(advantage)
+
+    return advantage, returns_choice, returns_target
 
 
 # -----------------------------------------------------------------------------
-# PPO Agent
+# dhvl Agent
 # -----------------------------------------------------------------------------
 
-class PPOAgent(A2CAgent):
-    """A2CAgent-compatible PPO agent with standard GAE + minibatch shuffle."""
+class dhvlAgent(A2CAgent):
+    """A2CAgent-compatible dhvl agent with standard GAE + minibatch shuffle."""
 
-    def __init__(self, ppo_cfg: PPOConfig, **kwargs: Dict[str, Any]):
+    def __init__(self, dhvl_cfg: dhvlConfig, **kwargs: Dict[str, Any]):
         super().__init__(**kwargs)
-        self.ppo_cfg = ppo_cfg
+        self.dhvl_cfg = dhvl_cfg
 
     # -----------------------------
     # Rollout (collect [T,B,...])
     # -----------------------------
-    def _rollout(self, params, acting_state: ActingState) -> Tuple[ActingState, RolloutTB, jnp.ndarray]:
+    def _rollout(self, params, acting_state: ActingState):
         env = self.env
         dist = self.actor_critic_networks.parametric_action_distribution
         policy_apply = self.actor_critic_networks.policy_network.apply
@@ -232,8 +269,9 @@ class PPOAgent(A2CAgent):
             logp = dist.log_prob(logits, raw_action)
             action = dist.postprocess(raw_action)
 
-            value = value_apply(params.critic, obs).astype(jnp.float32)
-            value = _maybe_squeeze_last(value)
+            v_t_choice, v_t_target = value_apply(params.critic, obs)
+            v_t_choice = _maybe_squeeze_last(v_t_choice).astype(jnp.float32)
+            v_t_target = _maybe_squeeze_last(v_t_target).astype(jnp.float32)
 
             next_state, next_ts = env.step(carry.state, action)
 
@@ -249,76 +287,77 @@ class PPOAgent(A2CAgent):
             reward = _maybe_squeeze_last(next_ts.reward).astype(jnp.float32)
             discount = _maybe_squeeze_last(next_ts.discount).astype(jnp.float32)
 
-            transition = (obs, raw_action, logp, value, reward, discount)
+            transition = (obs, raw_action, logp, v_t_choice, v_t_target, reward, discount)
             return new_acting_state, transition
 
         keys = jax.random.split(acting_state.key, T)  # [T,2]
         new_acting_state, traj = jax.lax.scan(one_step, acting_state, keys)
 
-        obs_T, raw_action_T, logp_T, value_T, reward_T, discount_T = traj
+        obs_T, raw_action_T, logp_T, v_t_choice,v_t_target, reward_T, discount_T = traj
 
         # Bootstrap at last observation after T steps
         last_obs = new_acting_state.timestep.observation
-        last_value = value_apply(params.critic, last_obs).astype(jnp.float32)
-        last_value = _maybe_squeeze_last(last_value)  # [B]
-
+        last_value_choice, last_value_target = value_apply(params.critic, last_obs)
+        last_value_choice = _maybe_squeeze_last(last_value_choice).astype(jnp.float32)
+        last_value_target = _maybe_squeeze_last(last_value_target).astype(jnp.float32)
         rollout = RolloutTB(
             observation=obs_T,
             raw_action=raw_action_T,
             logp_old=logp_T.astype(jnp.float32),
-            value_old=value_T.astype(jnp.float32),
+            value_choice_old=v_t_choice.astype(jnp.float32),
+            value_target_old=v_t_target.astype(jnp.float32),
             reward=reward_T.astype(jnp.float32),
             discount=discount_T.astype(jnp.float32),
         )
-        return new_acting_state, rollout, last_value
+        return new_acting_state, rollout, last_value_choice,last_value_target
 
     # -----------------------------
-    # Build flat batch for PPO
+    # Build flat batch for dhvl
     # -----------------------------
-    def _build_batch(self, rollout: RolloutTB, last_value: jnp.ndarray) -> PPOBatchN:
+    def _build_batch(self, rollout: RolloutTB, last_value_choice: jnp.ndarray,
+                     last_value_target: jnp.ndarray) -> dhvlBatchN:
         rewards = rollout.reward
         discounts = rollout.discount
-        values = rollout.value_old
+        v_choice_old_TB = rollout.value_choice_old
+        v_target_old_TB = rollout.value_target_old
 
-        # Pull gamma/lambda from A2C agent fields if present; otherwise fallback
         gamma = float(getattr(self, "discount_factor", 0.99))
-        lam = float(getattr(self, "bootstrapping_factor", 0.95))
+        lam = float(getattr(self, "bootstrapping_factor", 0.90))
 
-        adv, ret = _compute_gae(rewards, discounts, values, last_value, gamma=gamma, lam=lam)
+        adv_TB, ret_choice_TB, ret_target_TB = _compute_highway_v_learning(
+            rewards, discounts,
+            v_choice_old_TB, v_target_old_TB,
+            last_value_choice, last_value_target,
+            gamma=gamma, lam=lam
+        )
 
-        if self.ppo_cfg.normalize_adv:
-            adv_flat = adv.reshape((-1,))
-            adv_mean = adv_flat.mean()
-            adv_std = adv_flat.std() + 1e-8
-            adv = (adv - adv_mean) / adv_std
+        if self.dhvl_cfg.normalize_adv:
+            adv_flat = adv_TB.reshape((-1,))
+            adv_TB = (adv_TB - adv_flat.mean()) / (adv_flat.std() + 1e-8)
 
-        # Flatten TB -> N
-        T = int(rewards.shape[0])
-        B = int(rewards.shape[1])
+        T, B = int(rewards.shape[0]), int(rewards.shape[1])
         obs_N = _tree_reshape_TB_to_N(rollout.observation, T, B)
         raw_action_N = _tree_reshape_TB_to_N(rollout.raw_action, T, B)
 
-        logp_N = rollout.logp_old.reshape((T * B,))
-        v_old_N = rollout.value_old.reshape((T * B,))
-        adv_N = adv.reshape((T * B,))
-        ret_N = ret.reshape((T * B,))
-
-        return PPOBatchN(
+        batch = dhvlBatchN(
             observation=obs_N,
             raw_action=raw_action_N,
-            logp_old=jax.lax.stop_gradient(logp_N),
-            value_old=jax.lax.stop_gradient(v_old_N),
-            advantage=jax.lax.stop_gradient(adv_N),
-            returns=jax.lax.stop_gradient(ret_N),
+            logp_old=jax.lax.stop_gradient(rollout.logp_old.reshape((T * B,))),
+            value_choice_old=jax.lax.stop_gradient(v_choice_old_TB.reshape((T * B,))),
+            value_target_old=jax.lax.stop_gradient(v_target_old_TB.reshape((T * B,))),
+            advantage=jax.lax.stop_gradient(adv_TB.reshape((T * B,))),
+            returns_choice=jax.lax.stop_gradient(ret_choice_TB.reshape((T * B,))),
+            returns_target=jax.lax.stop_gradient(ret_target_TB.reshape((T * B,))),
         )
+        return batch
 
     # -----------------------------
     # Loss on one minibatch
     # -----------------------------
-    def _ppo_loss(
+    def _dhvl_loss(
         self,
         params,
-        batch_mb: PPOBatchN,            # each field has leading dim [M] where M=minibatch_size
+        batch_mb: dhvlBatchN,            # each field has leading dim [M] where M=minibatch_size
         mb_mask: jnp.ndarray,           # [M] float32 {0,1}
         rng: jax.Array,
     ) -> Tuple[jnp.ndarray, Dict[str, jnp.ndarray]]:
@@ -334,7 +373,7 @@ class PPOAgent(A2CAgent):
         logp_new = dist.log_prob(logits, batch_mb.raw_action).astype(jnp.float32)
         ratio = jnp.exp(logp_new - batch_mb.logp_old)
 
-        eps = float(self.ppo_cfg.clip_eps)
+        eps = float(self.dhvl_cfg.clip_eps)
         adv = batch_mb.advantage
 
         pg_loss_unclipped = ratio * adv
@@ -342,24 +381,44 @@ class PPOAgent(A2CAgent):
         pg_loss = -_masked_mean(jnp.minimum(pg_loss_unclipped, pg_loss_clipped), mb_mask)
 
         # Value forward
-        v_new = value_apply(params.critic, batch_mb.observation).astype(jnp.float32)
-        v_new = _maybe_squeeze_last(v_new)
+        v_choice_new, v_target_new = value_apply(params.critic, batch_mb.observation)
+        v_choice_new = _maybe_squeeze_last(v_choice_new).astype(jnp.float32)
+        v_target_new = _maybe_squeeze_last(v_target_new).astype(jnp.float32)
 
-        if self.ppo_cfg.clip_value_loss:
-            v_eps = float(self.ppo_cfg.value_clip_eps) if self.ppo_cfg.value_clip_eps is not None else eps
-            v_clipped = batch_mb.value_old + jnp.clip(v_new - batch_mb.value_old, -v_eps, v_eps)
-            v_loss1 = jnp.square(v_new - batch_mb.returns)
-            v_loss2 = jnp.square(v_clipped - batch_mb.returns)
-            v_loss = 0.5 * _masked_mean(jnp.maximum(v_loss1, v_loss2), mb_mask)
+        if self.dhvl_cfg.clip_value_loss:
+            v_eps = float(self.dhvl_cfg.value_clip_eps) if self.dhvl_cfg.value_clip_eps is not None else eps
+
+            # --- choice head ---
+            v_choice_old = batch_mb.value_choice_old.astype(jnp.float32)
+            ret_choice = batch_mb.returns_choice.astype(jnp.float32)
+
+            v_choice_clipped = v_choice_old + jnp.clip(v_choice_new - v_choice_old, -v_eps, v_eps)
+            v_loss1_c = jnp.square(v_choice_new - ret_choice)
+            v_loss2_c = jnp.square(v_choice_clipped - ret_choice)
+            v_loss_choice = 0.5 * _masked_mean(jnp.maximum(v_loss1_c, v_loss2_c), mb_mask)
+
+            # --- target head ---
+            v_target_old = batch_mb.value_target_old.astype(jnp.float32)
+            ret_target = batch_mb.returns_target.astype(jnp.float32)
+
+            v_target_clipped = v_target_old + jnp.clip(v_target_new - v_target_old, -v_eps, v_eps)
+            v_loss1_t = jnp.square(v_target_new - ret_target)
+            v_loss2_t = jnp.square(v_target_clipped - ret_target)
+            v_loss_target = 0.5 * _masked_mean(jnp.maximum(v_loss1_t, v_loss2_t), mb_mask)
+
         else:
-            v_loss = 0.5 * _masked_mean(jnp.square(v_new - batch_mb.returns), mb_mask)
+            v_loss_choice = 0.5 * _masked_mean(jnp.square(v_choice_new - batch_mb.returns_choice), mb_mask)
+            v_loss_target = 0.5 * _masked_mean(jnp.square(v_target_new - batch_mb.returns_target), mb_mask)
+
+
+        v_loss = 0.5 * (v_loss_choice + v_loss_target)
 
         # Entropy bonus
         rng, ent_key = jax.random.split(rng)
         entropy = dist.entropy(logits, ent_key).astype(jnp.float32)
         ent = _masked_mean(entropy, mb_mask)
 
-        total_loss = pg_loss + self.ppo_cfg.vf_coef * v_loss - self.ppo_cfg.ent_coef * ent
+        total_loss = pg_loss + self.dhvl_cfg.vf_coef * v_loss - self.dhvl_cfg.ent_coef * ent
 
         approx_kl = _masked_mean(batch_mb.logp_old - logp_new, mb_mask)
         clipfrac = _masked_mean((jnp.abs(ratio - 1.0) > eps).astype(jnp.float32), mb_mask)
@@ -368,12 +427,17 @@ class PPOAgent(A2CAgent):
             "loss/total": total_loss,
             "loss/policy": pg_loss,
             "loss/value": v_loss,
+            "loss/value_choice": v_loss_choice,
+            "loss/value_target": v_loss_target,
             "stats/entropy": ent,
             "stats/approx_kl": approx_kl,
             "stats/clipfrac": clipfrac,
             "stats/adv_mean": _masked_mean(adv, mb_mask),
             "stats/ratio_mean": _masked_mean(ratio, mb_mask),
-            "stats/value_mean": _masked_mean(v_new, mb_mask),
+            "stats/value_choice_mean": _masked_mean(v_choice_new, mb_mask),
+            "stats/value_target_mean": _masked_mean(v_target_new, mb_mask),
+            "stats/ret_choice_mean": _masked_mean(batch_mb.returns_choice, mb_mask),
+            "stats/ret_target_mean": _masked_mean(batch_mb.returns_target, mb_mask),
         }
         return total_loss, metrics
 
@@ -381,10 +445,10 @@ class PPOAgent(A2CAgent):
     # Main API: run_epoch (do not rename)
     # -----------------------------
     def run_epoch(self, training_state):
-        """One PPO iteration:
+        """One dhvl iteration:
         1) rollout T steps on B envs
         2) compute GAE + returns
-        3) PPO updates: update_epochs * num_minibatches with shuffle each epoch
+        3) dhvl updates: update_epochs * num_minibatches with shuffle each epoch
         """
         params = training_state.params_state.params
         opt_state = training_state.params_state.opt_state
@@ -392,37 +456,29 @@ class PPOAgent(A2CAgent):
         acting_state = training_state.acting_state
 
         # 1) rollout
-        acting_state, rollout, last_value = self._rollout(params, acting_state)
+        acting_state, rollout, last_value_choice, last_value_target = self._rollout(params, acting_state)
 
         # 2) build flat batch
-        batchN = self._build_batch(rollout, last_value)
+        batchN = self._build_batch(rollout, last_value_choice, last_value_target)
         N = int(batchN.logp_old.shape[0])  # static python int
 
-        mb = int(self.ppo_cfg.minibatch_size)
+        mb = int(self.dhvl_cfg.minibatch_size)
         if mb <= 0:
             mb = N  # full batch
 
         num_minibatches = (N + mb - 1) // mb  # python int, static
-        update_epochs = int(self.ppo_cfg.update_epochs)
+        update_epochs = int(self.dhvl_cfg.update_epochs)
 
-        global_step0 = jnp.asarray(update_count, dtype=jnp.int32)
-
-        d = int(self.ppo_cfg.policy_delay)
-
-        def zero_tree(t):
-            return jax.tree_util.tree_map(jnp.zeros_like, t)
-
-
-        # 3) PPO updates (JAX-friendly: fixed-shape minibatches via padding+mask)
+        # 3) dhvl updates (JAX-friendly: fixed-shape minibatches via padding+mask)
         def one_epoch(carry, key_epoch):
-            params, opt_state, key, global_step = carry
+            params, opt_state, key = carry
             key, perm_key, mbkey = jax.random.split(key, 3)
 
             idx_mat, mask_mat = _make_minibatch_indices(perm_key, N, mb)  # [M,mb], [M,mb]
             mb_keys = jax.random.split(mbkey, num_minibatches)
 
             def one_minibatch(carry2, xs):
-                params, opt_state, global_step = carry2
+                params, opt_state = carry2
                 idx, m_mask, k = xs  # idx [mb], m_mask [mb]
 
                 def _gather(tree):
@@ -433,52 +489,46 @@ class PPOAgent(A2CAgent):
                     return jax.tree_util.tree_map(g, tree)
 
                 # Gather minibatch (fixed shape [mb,...])
-                mbatch = PPOBatchN(
+                mbatch = dhvlBatchN(
                     observation=_gather(batchN.observation),
                     raw_action=_gather(batchN.raw_action),
                     logp_old=batchN.logp_old[idx],
-                    value_old=batchN.value_old[idx],
+                    value_choice_old=batchN.value_choice_old[idx],
+                    value_target_old=batchN.value_target_old[idx],
+                    returns_choice=batchN.returns_choice[idx],
+                    returns_target=batchN.returns_target[idx],
                     advantage=batchN.advantage[idx],
-                    returns=batchN.returns[idx],
                 )
 
                 def loss_fn(p):
-                    return self._ppo_loss(p, mbatch, m_mask, k)
+                    return self._dhvl_loss(p, mbatch, m_mask, k)
 
                 (loss, metrics), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
-
-                # delayed actor update
-                do_actor = (global_step % d) == 0
-                grads_actor = jax.lax.cond(
-                    do_actor,
-                    lambda g: g,
-                    lambda g: zero_tree(g),
-                    grads.actor,
-                )
-                grads = grads._replace(actor=grads_actor)
 
                 updates, opt_state = self.optimizer.update(grads, opt_state, params)
                 params = jax.tree_util.tree_map(lambda w, u: w + u, params, updates)
 
+                # add grad norm metric (actor)
+                actor_grads = jax.tree_util.tree_leaves(grads.actor)
+                actor_gn = jnp.sqrt(sum(jnp.sum(jnp.square(g)) for g in actor_grads if g is not None))
                 metrics = dict(metrics)
-                metrics["stats/grad_norm_actor"] = do_actor.astype(jnp.float32)
-                global_step = global_step + 1
-                return (params, opt_state, global_step), metrics
+                metrics["stats/grad_norm_actor"] = actor_gn
+                return (params, opt_state), metrics
 
-            (params, opt_state, global_step), metrics_seq = jax.lax.scan(
-                one_minibatch, (params, opt_state, global_step), (idx_mat, mask_mat, mb_keys)
+            (params, opt_state), metrics_seq = jax.lax.scan(
+                one_minibatch, (params, opt_state), (idx_mat, mask_mat, mb_keys)
             )
             # return last minibatch metrics of this epoch
             metrics_last = jax.tree_util.tree_map(lambda x: x[-1], metrics_seq)
-            return (params, opt_state, key, global_step), metrics_last
+            return (params, opt_state, key), metrics_last
 
         # epoch keys and update rng
         key = acting_state.key
         key, epoch_key = jax.random.split(key)
         epoch_keys = jax.random.split(epoch_key, update_epochs)
 
-        (params, opt_state, key, global_step), metrics_seq = jax.lax.scan(
-            one_epoch, (params, opt_state, key, global_step0), epoch_keys
+        (params, opt_state, key), metrics_seq = jax.lax.scan(
+            one_epoch, (params, opt_state, key), epoch_keys
         )
         # take last epoch's metrics (scalar dict)
         metrics = jax.tree_util.tree_map(lambda x: x[-1], metrics_seq)
