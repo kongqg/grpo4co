@@ -16,6 +16,7 @@ Constraint from user: `run_epoch` function name must remain unchanged.
 
 from __future__ import annotations
 
+import sys
 from typing import Any, Dict, Tuple
 
 import jax
@@ -282,15 +283,14 @@ class PPOAgent(A2CAgent):
 
         # Pull gamma/lambda from A2C agent fields if present; otherwise fallback
         gamma = float(getattr(self, "discount_factor", 0.99))
-        lam = float(getattr(self, "bootstrapping_factor", 0.95))
+        lam = float(getattr(self.ppo_cfg, "bootstrapping_factor", 0.95))
 
         adv, ret = _compute_gae(rewards, discounts, values, last_value, gamma=gamma, lam=lam)
 
-        if self.ppo_cfg.normalize_adv:
-            adv_flat = adv.reshape((-1,))
-            adv_mean = adv_flat.mean()
-            adv_std = adv_flat.std() + 1e-8
-            adv = (adv - adv_mean) / adv_std
+        adv_flat = adv.reshape((-1,))
+        adv_mean = adv_flat.mean()
+        adv_std = adv_flat.std() + 1e-8
+        adv = (adv - adv_mean) / adv_std
 
         # Flatten TB -> N
         T = int(rewards.shape[0])
@@ -377,6 +377,7 @@ class PPOAgent(A2CAgent):
         }
         return total_loss, metrics
 
+
     # -----------------------------
     # Main API: run_epoch (do not rename)
     # -----------------------------
@@ -405,24 +406,16 @@ class PPOAgent(A2CAgent):
         num_minibatches = (N + mb - 1) // mb  # python int, static
         update_epochs = int(self.ppo_cfg.update_epochs)
 
-        global_step0 = jnp.asarray(update_count, dtype=jnp.int32)
-
-        d = int(self.ppo_cfg.policy_delay)
-
-        def zero_tree(t):
-            return jax.tree_util.tree_map(jnp.zeros_like, t)
-
-
         # 3) PPO updates (JAX-friendly: fixed-shape minibatches via padding+mask)
         def one_epoch(carry, key_epoch):
-            params, opt_state, key, global_step = carry
+            params, opt_state, key = carry
             key, perm_key, mbkey = jax.random.split(key, 3)
 
             idx_mat, mask_mat = _make_minibatch_indices(perm_key, N, mb)  # [M,mb], [M,mb]
             mb_keys = jax.random.split(mbkey, num_minibatches)
 
             def one_minibatch(carry2, xs):
-                params, opt_state, global_step = carry2
+                params, opt_state = carry2
                 idx, m_mask, k = xs  # idx [mb], m_mask [mb]
 
                 def _gather(tree):
@@ -447,38 +440,30 @@ class PPOAgent(A2CAgent):
 
                 (loss, metrics), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
 
-                # delayed actor update
-                do_actor = (global_step % d) == 0
-                grads_actor = jax.lax.cond(
-                    do_actor,
-                    lambda g: g,
-                    lambda g: zero_tree(g),
-                    grads.actor,
-                )
-                grads = grads._replace(actor=grads_actor)
-
                 updates, opt_state = self.optimizer.update(grads, opt_state, params)
                 params = jax.tree_util.tree_map(lambda w, u: w + u, params, updates)
 
+                # add grad norm metric (actor)
+                actor_grads = jax.tree_util.tree_leaves(grads.actor)
+                actor_gn = jnp.sqrt(sum(jnp.sum(jnp.square(g)) for g in actor_grads if g is not None))
                 metrics = dict(metrics)
-                metrics["stats/grad_norm_actor"] = do_actor.astype(jnp.float32)
-                global_step = global_step + 1
-                return (params, opt_state, global_step), metrics
+                metrics["stats/grad_norm_actor"] = actor_gn
+                return (params, opt_state), metrics
 
-            (params, opt_state, global_step), metrics_seq = jax.lax.scan(
-                one_minibatch, (params, opt_state, global_step), (idx_mat, mask_mat, mb_keys)
+            (params, opt_state), metrics_seq = jax.lax.scan(
+                one_minibatch, (params, opt_state), (idx_mat, mask_mat, mb_keys)
             )
             # return last minibatch metrics of this epoch
             metrics_last = jax.tree_util.tree_map(lambda x: x[-1], metrics_seq)
-            return (params, opt_state, key, global_step), metrics_last
+            return (params, opt_state, key), metrics_last
 
         # epoch keys and update rng
         key = acting_state.key
         key, epoch_key = jax.random.split(key)
         epoch_keys = jax.random.split(epoch_key, update_epochs)
 
-        (params, opt_state, key, global_step), metrics_seq = jax.lax.scan(
-            one_epoch, (params, opt_state, key, global_step0), epoch_keys
+        (params, opt_state, key), metrics_seq = jax.lax.scan(
+            one_epoch, (params, opt_state, key), epoch_keys
         )
         # take last epoch's metrics (scalar dict)
         metrics = jax.tree_util.tree_map(lambda x: x[-1], metrics_seq)

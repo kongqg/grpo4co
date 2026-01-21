@@ -38,7 +38,7 @@ class dhvlConfig:
     # Entropy bonus weight
     ent_coef: float = 0.01
     # Number of dhvl epochs per rollout
-    update_epochs: int = 4
+    update_epochs: int = 2
     # Minibatch size used for dhvl updates
     minibatch_size: int = 64
     # Whether to normalize advantages across the rollout batch (recommended)
@@ -49,7 +49,7 @@ class dhvlConfig:
     value_clip_eps: float | None = None
     kl_coef: float = 0.2
     policy_delay: int = 2
-
+    bootstrapping_factor: float = 1.0
 
 # -----------------------------------------------------------------------------
 # Internal batch structures (PyTrees)
@@ -204,7 +204,7 @@ def _compute_highway_v_learning(
     d = discounts.astype(jnp.float32)     # [T,B]
 
     lambda_h = lam  # keep identical to your snippet
-
+    jax.debug.print("x:{a}",a=lambda_h)
     def highway_step(carry, xs):
         R_next_1, R_next_2 = carry                # each [B]
         r_t, d_t, v_tp1_t, v_tp2_t = xs           # each [B]
@@ -322,7 +322,7 @@ class dhvlAgent(A2CAgent):
         v_target_old_TB = rollout.value_target_old
 
         gamma = float(getattr(self, "discount_factor", 0.99))
-        lam = float(getattr(self, "bootstrapping_factor", 0.90))
+        lam = float(getattr(self, "bootstrapping_factor", 1.0))
 
         adv_TB, ret_choice_TB, ret_target_TB = _compute_highway_v_learning(
             rewards, discounts,
@@ -445,50 +445,48 @@ class dhvlAgent(A2CAgent):
     # Main API: run_epoch (do not rename)
     # -----------------------------
     def run_epoch(self, training_state):
-        """One dhvl iteration:
-        1) rollout T steps on B envs
-        2) compute GAE + returns
-        3) dhvl updates: update_epochs * num_minibatches with shuffle each epoch
-        """
         params = training_state.params_state.params
         opt_state = training_state.params_state.opt_state
         update_count = training_state.params_state.update_count
         acting_state = training_state.acting_state
 
-        # 1) rollout
         acting_state, rollout, last_value_choice, last_value_target = self._rollout(params, acting_state)
-
-        # 2) build flat batch
         batchN = self._build_batch(rollout, last_value_choice, last_value_target)
-        N = int(batchN.logp_old.shape[0])  # static python int
 
+        N = int(batchN.logp_old.shape[0])
         mb = int(self.dhvl_cfg.minibatch_size)
         if mb <= 0:
-            mb = N  # full batch
-
-        num_minibatches = (N + mb - 1) // mb  # python int, static
+            mb = N
+        num_minibatches = (N + mb - 1) // mb
         update_epochs = int(self.dhvl_cfg.update_epochs)
 
-        # 3) dhvl updates (JAX-friendly: fixed-shape minibatches via padding+mask)
+        global_step0 = jnp.asarray(update_count, dtype=jnp.int32)
+
+        d = int(self.dhvl_cfg.policy_delay)
+        d = 1 if d <= 0 else d  # 防止除0
+
+        def zero_tree(t):
+            return jax.tree_util.tree_map(jnp.zeros_like, t)
+
         def one_epoch(carry, key_epoch):
-            params, opt_state, key = carry
+            params, opt_state, key, global_step = carry
             key, perm_key, mbkey = jax.random.split(key, 3)
 
             idx_mat, mask_mat = _make_minibatch_indices(perm_key, N, mb)  # [M,mb], [M,mb]
             mb_keys = jax.random.split(mbkey, num_minibatches)
 
             def one_minibatch(carry2, xs):
-                params, opt_state = carry2
-                idx, m_mask, k = xs  # idx [mb], m_mask [mb]
+                params, opt_state, global_step = carry2
+                idx, m_mask, k = xs
 
                 def _gather(tree):
                     def g(x):
                         if isinstance(x, jnp.ndarray) and x.ndim >= 1 and x.shape[0] == N:
                             return x[idx]
                         return x
+
                     return jax.tree_util.tree_map(g, tree)
 
-                # Gather minibatch (fixed shape [mb,...])
                 mbatch = dhvlBatchN(
                     observation=_gather(batchN.observation),
                     raw_action=_gather(batchN.raw_action),
@@ -505,32 +503,38 @@ class dhvlAgent(A2CAgent):
 
                 (loss, metrics), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
 
+                # delayed actor update
+                do_actor = (global_step % d) == 0
+                grads_actor = jax.lax.cond(
+                    do_actor,
+                    lambda g: g,
+                    lambda g: zero_tree(g),
+                    grads.actor,
+                )
+                grads = grads._replace(actor=grads_actor)
+
                 updates, opt_state = self.optimizer.update(grads, opt_state, params)
                 params = jax.tree_util.tree_map(lambda w, u: w + u, params, updates)
 
-                # add grad norm metric (actor)
-                actor_grads = jax.tree_util.tree_leaves(grads.actor)
-                actor_gn = jnp.sqrt(sum(jnp.sum(jnp.square(g)) for g in actor_grads if g is not None))
                 metrics = dict(metrics)
-                metrics["stats/grad_norm_actor"] = actor_gn
-                return (params, opt_state), metrics
+                metrics["stats/do_actor_update"] = do_actor.astype(jnp.float32)
 
-            (params, opt_state), metrics_seq = jax.lax.scan(
-                one_minibatch, (params, opt_state), (idx_mat, mask_mat, mb_keys)
+                global_step = global_step + 1
+                return (params, opt_state, global_step), metrics
+
+            (params, opt_state, global_step), metrics_seq = jax.lax.scan(
+                one_minibatch, (params, opt_state, global_step), (idx_mat, mask_mat, mb_keys)
             )
-            # return last minibatch metrics of this epoch
             metrics_last = jax.tree_util.tree_map(lambda x: x[-1], metrics_seq)
-            return (params, opt_state, key), metrics_last
+            return (params, opt_state, key, global_step), metrics_last
 
-        # epoch keys and update rng
         key = acting_state.key
         key, epoch_key = jax.random.split(key)
         epoch_keys = jax.random.split(epoch_key, update_epochs)
 
-        (params, opt_state, key), metrics_seq = jax.lax.scan(
-            one_epoch, (params, opt_state, key), epoch_keys
+        (params, opt_state, key, global_step), metrics_seq = jax.lax.scan(
+            one_epoch, (params, opt_state, key, global_step0), epoch_keys
         )
-        # take last epoch's metrics (scalar dict)
         metrics = jax.tree_util.tree_map(lambda x: x[-1], metrics_seq)
 
         acting_state = acting_state._replace(key=key)
@@ -540,8 +544,6 @@ class dhvlAgent(A2CAgent):
             opt_state=opt_state,
             update_count=update_count + (update_epochs * num_minibatches),
         )
-        new_state = training_state._replace(
-            params_state=new_params_state,
-            acting_state=acting_state,
-        )
+        new_state = training_state._replace(params_state=new_params_state, acting_state=acting_state)
         return new_state, metrics
+

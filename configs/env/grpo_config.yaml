@@ -1,7 +1,7 @@
 # agent: "grpo"
 #agent: "a2c"
-# agent: "ppo"
-agent: "dhvl"
+agent: "ppo"
+# agent: "dhvl"
 grpo:
   supervision_mode: "outcome"
 #  supervision_mode: "process"
@@ -16,9 +16,14 @@ grpo:
 ppo:
   lambda: 0.95
   normalize_adv: True
-  kl_coef: 0.0
   clip_eps: 0.10
 
 dhvl:
-  dhvl_bootstrapping_factor: 1.0
-  policy_delay: int = 2
+  bootstrapping_factor: 1.90
+  policy_delay: 2
+  update_epochs: 4
+  tau: 0.5
+  clip_eps: 0.1
+  minibatch_size: 64
+  target_kl: 0.2
+  tar_tau: 0.01

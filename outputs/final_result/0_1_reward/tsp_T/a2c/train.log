@@ -1,0 +1,49 @@
+[2025-10-15 20:26:11,236][root][INFO] - agent: a2c
+grpo:
+  supervision_mode: outcome
+  clip_eps: 0.1
+  normalize_adv: true
+  kl_coef: 0.005
+  num_policy_updates: 2
+  repeats_per_instance: 8
+ppo:
+  lambda: 0.95
+env:
+  name: tsp
+  registered_version: TSP-v1
+  network:
+    transformer_num_blocks: 2
+    transformer_num_heads: 8
+    transformer_key_size: 16
+    transformer_mlp_units:
+    - 512
+    mean_cities_in_query: true
+  training:
+    num_epochs: 1000
+    num_learner_steps_per_epoch: 500
+    n_steps: 20
+    total_batch_size: 32
+  evaluation:
+    eval_total_batch_size: 10000
+    greedy_eval_total_batch_size: 10000
+  a2c:
+    normalize_advantage: false
+    discount_factor: 1.0
+    bootstrapping_factor: 0.95
+    l_pg: 1.0
+    l_td: 1.0
+    l_en: 0.005
+    learning_rate: 0.0001
+seed: 0
+logger:
+  type: tensorboard
+  project: grpo4co
+  name: tsp
+  save_checkpoint: true
+
+[2025-10-15 20:26:11,237][root][INFO] - {'devices': [cuda(id=0)]}
+[2025-10-15 20:26:11,513][root][INFO] - tsp
+[2025-10-15 20:26:15,649][root][INFO] - Starting logger.
+[2025-10-16 05:16:41,337][root][INFO] - Saving checkpoint...
+[2025-10-16 05:16:41,385][root][INFO] - Checkpoint saved at 'training_state'.
+[2025-10-16 05:16:41,385][root][INFO] - Closing logger...
