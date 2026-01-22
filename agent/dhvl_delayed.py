@@ -48,10 +48,10 @@ class dhvlConfig:
     # Use separate value clip epsilon; if None, reuse clip_eps
     value_clip_eps: float | None = None
     kl_coef: float = 0.2
-    policy_delay: int = 2
+    value_delay: int = 2
     bootstrapping_factor: float = 1.0
     tau: float = 0.9
-    target_kl: float = 0.3
+    tar_tau: float = 0.005
 
 # -----------------------------------------------------------------------------
 # Internal batch structures (PyTrees)
@@ -64,6 +64,7 @@ class RolloutTB:
     raw_action: Any                   # pytree with leaves [T, B, ...] or [T, B]
     logp_old: jnp.ndarray             # [T, B]
     value_choice_old: jnp.ndarray            # [T, B]
+    value_target_old: jnp.ndarray            # [T, B]
     reward: jnp.ndarray               # [T, B]
     discount: jnp.ndarray             # [T, B]  (0 at terminal, 1 otherwise)
 
@@ -153,6 +154,13 @@ def _masked_mean(x: jnp.ndarray, mask: jnp.ndarray) -> jnp.ndarray:
     mask = mask.astype(x.dtype)
     denom = jnp.maximum(mask.sum(), 1.0)
     return (x * mask).sum() / denom
+
+def target_update(critic, target_critic, tau: float):
+    new_target_params = jax.tree_multimap(
+        lambda p, tp: p * tau + tp * (1 - tau), critic.params,
+        target_critic.params)
+
+    return target_critic.replace(params=new_target_params)
 
 
 def _make_minibatch_indices(
@@ -259,8 +267,9 @@ class dhvlAgent(A2CAgent):
             logp = dist.log_prob(logits, raw_action)
             action = dist.postprocess(raw_action)
 
-            v_t_choice = value_apply(params.critic, obs)
+            v_t_choice, v_t_target = value_apply(params.critic, obs)
             v_t_choice = _maybe_squeeze_last(v_t_choice).astype(jnp.float32)
+            v_t_target = _maybe_squeeze_last(v_t_target).astype(jnp.float32)
 
             next_state, next_ts = env.step(carry.state, action)
 
@@ -276,46 +285,59 @@ class dhvlAgent(A2CAgent):
             reward = _maybe_squeeze_last(next_ts.reward).astype(jnp.float32)
             discount = _maybe_squeeze_last(next_ts.discount).astype(jnp.float32)
 
-            transition = (obs, raw_action, logp, v_t_choice, reward, discount)
+            transition = (obs, raw_action, logp, v_t_choice, v_t_target, reward, discount)
             return new_acting_state, transition
 
         keys = jax.random.split(acting_state.key, T)  # [T,2]
         new_acting_state, traj = jax.lax.scan(one_step, acting_state, keys)
 
-        obs_T, raw_action_T, logp_T, v_t_choice, reward_T, discount_T = traj
+        obs_T, raw_action_T, logp_T, v_t_choice, v_t_target, reward_T, discount_T = traj
 
         # Bootstrap at last observation after T steps
         last_obs = new_acting_state.timestep.observation
-        last_value_choice = value_apply(params.critic, last_obs)
+        last_value_choice, last_value_target = value_apply(params.critic, last_obs)
         last_value_choice = _maybe_squeeze_last(last_value_choice).astype(jnp.float32)
+        last_value_target = _maybe_squeeze_last(last_value_target).astype(jnp.float32)
+
         rollout = RolloutTB(
             observation=obs_T,
             raw_action=raw_action_T,
             logp_old=logp_T.astype(jnp.float32),
             value_choice_old=v_t_choice.astype(jnp.float32),
+            value_target_old=v_t_target.astype(jnp.float32),
             reward=reward_T.astype(jnp.float32),
             discount=discount_T.astype(jnp.float32),
         )
-        return new_acting_state, rollout, last_value_choice
+        return new_acting_state, rollout, last_value_choice, last_value_target
 
     # -----------------------------
     # Build flat batch for dhvl
     # -----------------------------
-    def _build_batch(self, rollout: RolloutTB, last_value_choice: jnp.ndarray,) -> dhvlBatchN:
+    def _build_batch(self, rollout: RolloutTB, last_value_choice: jnp.ndarray,last_value_target) -> dhvlBatchN:
         rewards = rollout.reward
         discounts = rollout.discount
         v_choice_old_TB = rollout.value_choice_old
+        v_target_old_Tb = rollout.value_target_old
 
         gamma = float(getattr(self, "discount_factor", 0.99))
         lam = float(getattr(self.dhvl_cfg, "bootstrapping_factor", 1.0))
 
-        adv_TB, ret_choice_TB = _compute_highway_v_learning(
-            rewards, discounts,
-            v_choice_old_TB,
-            last_value_choice,
-            gamma=gamma, lam=lam,
-            tau=self.dhvl_cfg.tau
-        )
+        if self.dhvl_cfg.value_delay > 0:
+            adv_TB, ret_choice_TB = _compute_highway_v_learning(
+                rewards, discounts,
+                v_target_old_Tb,
+                last_value_target,
+                gamma=gamma, lam=lam,
+                tau=self.dhvl_cfg.tau
+            )
+        else:
+            adv_TB, ret_choice_TB = _compute_highway_v_learning(
+                rewards, discounts,
+                v_choice_old_TB,
+                last_value_choice,
+                gamma=gamma, lam=lam,
+                tau=self.dhvl_cfg.tau
+            )
 
         adv_flat = adv_TB.reshape((-1,))
         adv_TB = (adv_TB - adv_flat.mean()) / (adv_flat.std() + 1e-8)
@@ -364,7 +386,7 @@ class dhvlAgent(A2CAgent):
         pg_loss = -_masked_mean(jnp.minimum(pg_loss_unclipped, pg_loss_clipped), mb_mask)
 
         # Value forward
-        v_choice_new = value_apply(params.critic, batch_mb.observation)
+        v_choice_new, v_target_new = value_apply(params.critic, batch_mb.observation)
         v_choice_new = _maybe_squeeze_last(v_choice_new).astype(jnp.float32)
 
         # if self.dhvl_cfg.clip_value_loss:
@@ -424,8 +446,8 @@ class dhvlAgent(A2CAgent):
         update_count = training_state.params_state.update_count
         acting_state = training_state.acting_state
 
-        acting_state, rollout, last_value_choice = self._rollout(params, acting_state)
-        batchN = self._build_batch(rollout, last_value_choice)
+        acting_state, rollout, last_value_choice, last_value_target = self._rollout(params, acting_state)
+        batchN = self._build_batch(rollout, last_value_choice, last_value_target)
 
         N = int(batchN.logp_old.shape[0])
         mb = int(self.dhvl_cfg.minibatch_size)
@@ -470,31 +492,26 @@ class dhvlAgent(A2CAgent):
                     return self._dhvl_loss(p, mbatch, m_mask, k)
 
                 (loss, metrics), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
-
-                # delayed actor update
-                # do_actor = (self.global_step % self.d) == 0
-                # grads_actor = jax.lax.cond(
-                #     do_actor,
-                #     lambda g: g,
-                #     lambda g: zero_tree(g),
-                #     grads.actor,
-                # )
-                # grads = grads._replace(actor=grads_actor)
-                # current_kl = metrics['stats/approx_kl']
-                # target_kl = self.dhvl_cfg.target_kl
-                # do_actor = jnp.logical_and(jnp.logical_not(stop_actor), current_kl <= target_kl)
-                # stop_actor = jnp.logical_or(current_kl >= target_kl, stop_actor)
+                gcritic = grads.critic
+                if isinstance(gcritic, dict) and "delayed_value" in gcritic:
+                    gcritic = {**gcritic,
+                               "delayed_value": jax.tree_util.tree_map(jnp.zeros_like, gcritic["delayed_value"])}
+                    grads = grads._replace(critic=gcritic)
 
                 updates, opt_state = self.optimizer.update(grads, opt_state, params)
-                # updates_actor = jax.lax.cond(
-                #     do_actor,
-                #     lambda u: u,
-                #     lambda u: zero_tree(u),
-                #     updates.actor,
-                # )
-                # updates = updates._replace(actor=updates_actor)
-
                 params = jax.tree_util.tree_map(lambda w, u: w + u, params, updates)
+                if self.dhvl_cfg.value_delay > 0:
+                    tau_tgt = float(self.dhvl_cfg.tar_tau)
+                    critic = params.critic
+                    critic = {
+                        **critic,
+                        "delayed_value": jax.tree_util.tree_map(
+                            lambda td, v: (1.0 - tau_tgt) * td + tau_tgt * v,
+                            critic["delayed_value"],
+                            critic["value"],
+                        ),
+                    }
+                    params = params._replace(critic=critic)
 
                 # metrics["stats/do_actor_update"] = do_actor.astype(jnp.float32)
                 # metrics["stats/stop_actor"] = stop_actor.astype(jnp.float32)

@@ -18,13 +18,12 @@ from jumanji.training.agents.a2c import A2CAgent
 
 from agent.grpo import GRPOAgent, GRPOConfig
 from agent.ppo import PPOConfig, PPOAgent
-from agent.dhvl import dhvlAgent, dhvlConfig
-from jumanji.environments import CVRP,TSP, BinPack, Knapsack,MultiCVRP
-#from jumanji.environments.logic.sliding_tile_puzzle.reward import SparseRewardFn
+from jumanji.environments import CVRP, TSP, BinPack, Knapsack, MultiCVRP
+# from jumanji.environments.logic.sliding_tile_puzzle.reward import SparseRewardFn
 from jumanji.wrappers import MultiToSingleWrapper, VmapAutoResetWrapper
-#from jumanji.environments.logic.sliding_tile_puzzle.reward import (
- #   SparseRewardFn as STP_SparseRewardFn,
-#)
+# from jumanji.environments.logic.sliding_tile_puzzle.reward import (
+#   SparseRewardFn as STP_SparseRewardFn,
+# )
 
 from jumanji.environments.routing.cvrp.reward import (
     SparseReward as CVRP_SparseReward,
@@ -46,12 +45,15 @@ import jax
 import jax.numpy as jnp
 from jumanji.training.networks.base import FeedForwardNetwork
 
+
 def _copy_tree(tree):
     return jax.tree_util.tree_map(lambda x: x, tree)
+
 
 def polyak_update(target, online, tau: float):
     # target <- (1-tau)*target + tau*online
     return jax.tree_util.tree_map(lambda t, s: (1.0 - tau) * t + tau * s, target, online)
+
 
 class VAndDoubleQNetworks(FeedForwardNetwork):
     """
@@ -69,7 +71,7 @@ class VAndDoubleQNetworks(FeedForwardNetwork):
     def init(self, key, obs):
         key_v, key_q1, key_q2 = jax.random.split(key, 3)
 
-        v_params  = self.v_structure.init(key_v, obs)
+        v_params = self.v_structure.init(key_v, obs)
         q1_params = self.q_structure.init(key_q1, obs)
         q2_params = self.q_structure.init(key_q2, obs)
 
@@ -93,13 +95,13 @@ class VAndDoubleQNetworks(FeedForwardNetwork):
 
     def apply_q(self, params, obs, act):
         # q_structure 输出 [B, A]，我们 gather 得到 [B]
-        q1_all  = self.q_structure.apply(params["q1"], obs)
-        q2_all  = self.q_structure.apply(params["q2"], obs)
+        q1_all = self.q_structure.apply(params["q1"], obs)
+        q2_all = self.q_structure.apply(params["q2"], obs)
         tq1_all = self.q_structure.apply(params["tq1"], obs)
         tq2_all = self.q_structure.apply(params["tq2"], obs)
 
-        q1  = self._gather_q(q1_all, act)
-        q2  = self._gather_q(q2_all, act)
+        q1 = self._gather_q(q1_all, act)
+        q2 = self._gather_q(q2_all, act)
         tq1 = self._gather_q(tq1_all, act)
         tq2 = self._gather_q(tq2_all, act)
         return q1, q2, tq1, tq2
@@ -128,11 +130,12 @@ class DoubleValueNetwork:
         v2 = self.base.apply(params["delayed_value"], obs)
         return v1, v2
 
+
 def setup_env(cfg: DictConfig) -> Environment:
     if cfg.grpo.reward_mode == "sparse":
-        #if cfg.env.name == "sliding_tile_puzzle":
-         #   jax.debug.print("sliding_tile_puzzle reward mode is sparse")
-          #  env = SlidingTilePuzzle(reward_fn=STP_SparseRewardFn())
+        # if cfg.env.name == "sliding_tile_puzzle":
+        #   jax.debug.print("sliding_tile_puzzle reward mode is sparse")
+        #  env = SlidingTilePuzzle(reward_fn=STP_SparseRewardFn())
         if cfg.env.name == "cvrp":
             jax.debug.print("cvrp reward mode is sparse")
             env = CVRP(reward_fn=CVRP_SparseReward())
@@ -158,13 +161,16 @@ def setup_env(cfg: DictConfig) -> Environment:
     env = VmapAutoResetWrapper(env)
     return env
 
+
 def setup_evaluators(cfg, agent):
     from jumanji.training.setup_train import setup_evaluators as _setup_evaluators
     return _setup_evaluators(cfg, agent)
 
+
 def setup_training_state(env, agent, init_key):
     from jumanji.training.setup_train import setup_training_state as _setup_training_state
     return _setup_training_state(env, agent, init_key)
+
 
 def setup_logger(cfg: DictConfig):
     return _setup_logger(cfg)
@@ -257,22 +263,15 @@ def setup_agent(cfg: DictConfig, env: Environment):
         #     policy_network=policy_structure,  # <--- Actor 用的 (第1个)
         #     value_network=complex_critic  # <--- Critic 用的 (第2-6个)
         # )
-
-        # ac = actor_critic_networks._replace(
-        #     value_network=DoubleValueNetwork(actor_critic_networks.value_network))
-        # actor_critic_networks = ac
-
+        from agent.dhvl import dhvlAgent, dhvlConfig
         optimizer = optax.adam(cfg.env.a2c.learning_rate)
         dhvl_cfg = dhvlConfig(
             clip_eps=cfg.dhvl.clip_eps,
             normalize_adv=cfg.ppo.normalize_adv,
             bootstrapping_factor=cfg.dhvl.bootstrapping_factor,
-            policy_delay=cfg.dhvl.policy_delay,
             update_epochs=cfg.dhvl.update_epochs,
             tau=cfg.dhvl.tau,
             minibatch_size=cfg.dhvl.minibatch_size,
-            target_kl=cfg.dhvl.target_kl,
-            # tar_tau=cfg.dhvl.tar_tau,
         )
         return dhvlAgent(
             env=env,
@@ -288,6 +287,47 @@ def setup_agent(cfg: DictConfig, env: Environment):
             l_en=cfg.env.a2c.l_en,
             dhvl_cfg=dhvl_cfg,
         )
+    elif cfg.agent == "dhvl_delay":
+        # complex_critic = VAndDoubleQNetworks(
+        #     v_structure=value_structure,
+        #     q_structure=policy_structure  # 复用图纸，不共享参数
+        # )
+        # new_actor_critic_networks = actor_critic_networks._replace(
+        #     policy_network=policy_structure,  # <--- Actor 用的 (第1个)
+        #     value_network=complex_critic  # <--- Critic 用的 (第2-6个)
+        # )
+        from agent.dhvl_delayed import dhvlAgent, dhvlConfig
+        ac = actor_critic_networks._replace(
+            value_network=DoubleValueNetwork(actor_critic_networks.value_network))
+        actor_critic_networks = ac
+
+
+        optimizer = optax.adam(cfg.env.a2c.learning_rate)
+        dhvl_cfg = dhvlConfig(
+            clip_eps=cfg.dhvl.clip_eps,
+            normalize_adv=cfg.ppo.normalize_adv,
+            bootstrapping_factor=cfg.dhvl.bootstrapping_factor,
+            value_delay=cfg.dhvl.value_delay,
+            update_epochs=cfg.dhvl.update_epochs,
+            tau=cfg.dhvl.tau,
+            minibatch_size=cfg.dhvl.minibatch_size,
+            tar_tau=cfg.dhvl.tar_tau,
+        )
+        return dhvlAgent(
+            env=env,
+            n_steps=cfg.env.training.n_steps,
+            total_batch_size=cfg.env.training.total_batch_size,
+            actor_critic_networks=actor_critic_networks,
+            optimizer=optimizer,
+            normalize_advantage=False,
+            discount_factor=cfg.env.a2c.discount_factor,
+            bootstrapping_factor=cfg.env.a2c.bootstrapping_factor,
+            l_pg=cfg.env.a2c.l_pg,
+            l_td=cfg.env.a2c.l_td,
+            l_en=cfg.env.a2c.l_en,
+            dhvl_cfg=dhvl_cfg,
+        )
+
 
 
     else:

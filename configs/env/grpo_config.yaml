@@ -1,7 +1,8 @@
 # agent: "grpo"
 #agent: "a2c"
-agent: "ppo"
+# agent: "ppo"
 # agent: "dhvl"
+agent: "dhvl_delay"
 grpo:
   supervision_mode: "outcome"
 #  supervision_mode: "process"
@@ -19,11 +20,11 @@ ppo:
   clip_eps: 0.10
 
 dhvl:
-  bootstrapping_factor: 1.90
-  policy_delay: 2
+  bootstrapping_factor: 1.05
+  value_delay: 1
   update_epochs: 4
-  tau: 0.5
+  tau: 0.9
   clip_eps: 0.1
   minibatch_size: 64
   target_kl: 0.2
-  tar_tau: 0.01
+  tar_tau: 0.2

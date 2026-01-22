@@ -1,5 +1,5 @@
 """
-dhvl.py
+dhvl_delayed.py
 
 A readable, standard dhvl implementation for Jumanji-style agents (JAX + Haiku),
 written to be JIT/scan-friendly.
