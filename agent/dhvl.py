@@ -355,40 +355,34 @@ class dhvlAgent(A2CAgent):
 
         logp_new = dist.log_prob(logits, batch_mb.raw_action).astype(jnp.float32)
         ratio = jnp.exp(logp_new - batch_mb.logp_old)
-
         eps = float(self.dhvl_cfg.clip_eps)
         adv = batch_mb.advantage
-
-        pg_loss_unclipped = ratio * adv
-        pg_loss_clipped = jnp.clip(ratio, 1.0 - eps, 1.0 + eps) * adv
-        pg_loss = -_masked_mean(jnp.minimum(pg_loss_unclipped, pg_loss_clipped), mb_mask)
-
+        tau = self.dhvl_cfg.tau
+        w = jnp.where(adv > 0, 2.0 * tau, 2.0 * (1.0 - tau))
+        tau = self.dhvl_cfg.tau
+        surr1 = ratio * adv
+        surr2 = jnp.clip(ratio, 1.0 - eps, 1.0 + eps) * adv
+        surr1_w = w * surr1
+        surr2_w = w * surr2
+        pg_loss = -_masked_mean(jnp.minimum(surr1_w, surr2_w), mb_mask)
         # Value forward
         v_choice_new = value_apply(params.critic, batch_mb.observation)
         v_choice_new = _maybe_squeeze_last(v_choice_new).astype(jnp.float32)
 
-        # if self.dhvl_cfg.clip_value_loss:
-        #     v_eps = float(self.dhvl_cfg.value_clip_eps) if self.dhvl_cfg.value_clip_eps is not None else eps
-        #
-        #     # --- choice head ---
-        #     v_choice_old = batch_mb.value_choice_old.astype(jnp.float32)
-        #     ret_choice = batch_mb.returns_choice.astype(jnp.float32)
-        #
-        #     v_choice_clipped = v_choice_old + jnp.clip(v_choice_new - v_choice_old, -v_eps, v_eps)
-        #     v_loss1_c = jnp.square(v_choice_new - ret_choice)
-        #     v_loss2_c = jnp.square(v_choice_clipped - ret_choice)
-        #     v_loss_choice = 0.5 * _masked_mean(jnp.maximum(v_loss1_c, v_loss2_c), mb_mask)
-        #
-        # else:
-        #     v_loss_choice = 0.5 * _masked_mean(jnp.square(v_choice_new - batch_mb.returns_choice), mb_mask)
-
         # expectile loss for value
         delta = batch_mb.returns_choice.astype(jnp.float32) - v_choice_new  # [M]
+        returns = batch_mb.returns_choice.astype(jnp.float32)
 
-        tau_e = self.dhvl_cfg.tau
-        w = jnp.where(delta > 0, tau_e, 1.0 - tau_e)  # [M]
-
-        v_loss_choice = _masked_mean(w * (delta ** 2), mb_mask)  # scalar
+        v_eps = self.dhvl_cfg.clip_eps
+        v_choice_old = batch_mb.value_choice_old
+        v_clipped = v_choice_old + jnp.clip(v_choice_new - v_choice_old, -v_eps, v_eps)
+        delta1 = returns - v_choice_new
+        delta2 = returns - v_clipped
+        w1 = jnp.where(delta1 > 0, tau, 1.0 - tau)
+        w2 = jnp.where(delta2 > 0, tau, 1.0 - tau)
+        loss1 = w1 * (delta1 ** 2)
+        loss2 = w2 * (delta2 ** 2)
+        v_loss_choice = 0.5 * _masked_mean(jnp.maximum(loss1, loss2), mb_mask)
 
         # Entropy bonus
         rng, ent_key = jax.random.split(rng)
