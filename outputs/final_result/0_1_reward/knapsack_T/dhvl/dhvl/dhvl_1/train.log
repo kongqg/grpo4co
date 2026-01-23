@@ -1,4 +1,4 @@
-[2026-01-21 23:22:36,979][root][INFO] - agent: dhvl
+[2026-01-22 11:21:31,777][root][INFO] - agent: dhvl
 grpo:
   supervision_mode: outcome
   clip_eps: 0.1
@@ -12,14 +12,14 @@ ppo:
   normalize_adv: true
   clip_eps: 0.1
 dhvl:
-  bootstrapping_factor: 1.05
+  bootstrapping_factor: 1.58
   value_delay: 1
   update_epochs: 4
-  tau: 0.9
+  tau: 0.6
   clip_eps: 0.1
   minibatch_size: 64
   target_kl: 0.2
-  tar_tau: 0.01
+  tar_tau: 0.2
 env:
   name: knapsack
   registered_version: Knapsack-v1
@@ -52,5 +52,9 @@ logger:
   name: knapsack
   save_checkpoint: true
 
-[2026-01-21 23:22:36,980][root][INFO] - {'devices': [CudaDevice(id=0)]}
-[2026-01-21 23:22:37,273][root][INFO] - knapsack
+[2026-01-22 11:21:31,777][root][INFO] - {'devices': [CudaDevice(id=0)]}
+[2026-01-22 11:21:32,056][root][INFO] - knapsack
+[2026-01-22 11:21:42,890][root][INFO] - Starting logger.
+[2026-01-22 11:36:09,187][root][INFO] - Saving checkpoint...
+[2026-01-22 11:36:09,308][root][INFO] - Checkpoint saved at 'training_state'.
+[2026-01-22 11:36:09,308][root][INFO] - Closing logger...
